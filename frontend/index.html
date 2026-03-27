@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Distributed Drawing Board</title>
+  <style>
+    body { margin: 0; background: #1a1a2e; display: flex; flex-direction: column; align-items: center; }
+    h2   { color: #eee; font-family: sans-serif; margin: 12px 0 4px; }
+    #status { color: #aef; font-family: monospace; font-size: 13px; margin-bottom: 8px; }
+    canvas { background: #fff; border-radius: 8px; cursor: crosshair; touch-action: none; }
+    .controls { margin-top: 8px; }
+    button { margin: 4px; padding: 8px 16px; cursor: pointer; border-radius: 6px; border: none; background: #4a90e2; color: #fff; }
+    button:hover { background: #5aa0f2; }
+    input[type=color] { margin: 4px; cursor: pointer; height: 36px; width: 40px; border: none; }
+    input[type=range] { margin: 4px; }
+  </style>
+</head>
+<body>
+  <h2>🎨 Distributed Drawing Board (Mini-RAFT)</h2>
+  <div id="status">Connecting...</div>
+  <canvas id="canvas" width="900" height="600"></canvas>
+  <div class="controls">
+    <input type="color" id="color" value="#000000" title="Color" />
+    <input type="range" id="size" min="2" max="30" value="4" title="Brush size" />
+    <button onclick="clearCanvas()">Clear</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx    = canvas.getContext('2d');
+    const status = document.getElementById('status');
+    const colorPicker = document.getElementById('color');
+    const sizePicker  = document.getElementById('size');
+
+    let drawing = false;
+    let lastX = 0, lastY = 0;
+    let reconnectAttempts = 0;
+    let heartbeatInterval = null;
+
+    // ─── WebSocket with heartbeat ───────────────────────────────────────────
+    let ws;
+    function connect() {
+      ws = new WebSocket('ws://localhost:8080');
+      
+      // Clear heartbeat if exists
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+
+      ws.onopen = () => {
+        status.textContent = '✅ Connected to Gateway';
+        status.style.color = '#aef';
+        reconnectAttempts = 0;
+        
+        // Send heartbeat every 30 seconds
+        heartbeatInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 30000);
+      };
+
+      ws.onclose = () => {
+        status.textContent = '🔴 Disconnected — reconnecting...';
+        status.style.color = '#faa';
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        
+        reconnectAttempts++;
+        const delay = Math.min(5000, 1000 * Math.pow(2, reconnectAttempts));
+        setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        status.textContent = '⚠️ Connection error';
+        status.style.color = '#fa0';
+      };
+
+      ws.onmessage = ({ data }) => {
+        console.log('Received message:', data); // DEBUG: See all messages
+        
+        try {
+          const message = JSON.parse(data);
+          console.log('Parsed message:', message); // DEBUG: See parsed message
+          
+          // Handle ping responses
+          if (message.type === 'pong') {
+            console.log('Received pong');
+            return;
+          }
+          
+          // Handle clear command
+          if (message.type === 'clear') {
+            console.log('🔵 CLEAR COMMAND RECEIVED! Clearing canvas...');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            console.log('Canvas cleared by remote user');
+            return;
+          }
+          
+          // Handle regular stroke
+          drawStroke(message, false);
+        } catch (e) {
+          console.error('Error parsing message:', e);
+          // Handle legacy format or errors
+          try {
+            const stroke = JSON.parse(data);
+            drawStroke(stroke, false);
+          } catch (err) {
+            console.error('Invalid message:', data);
+          }
+        }
+      };
+    }
+    connect();
+
+    // ─── Drawing ────────────────────────────────────────────────────────────
+    function drawStroke(stroke, send = true) {
+      ctx.beginPath();
+      ctx.moveTo(stroke.x0, stroke.y0);
+      ctx.lineTo(stroke.x1, stroke.y1);
+      ctx.strokeStyle = stroke.color;
+      ctx.lineWidth   = stroke.size;
+      ctx.lineCap     = 'round';
+      ctx.lineJoin    = 'round';
+      ctx.stroke();
+
+      if (send && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(stroke));
+      }
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      drawing = true;
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      lastX = (e.clientX - rect.left) * scaleX;
+      lastY = (e.clientY - rect.top) * scaleY;
+      e.preventDefault();
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (!drawing) return;
+      e.preventDefault();
+      
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const currentX = (e.clientX - rect.left) * scaleX;
+      const currentY = (e.clientY - rect.top) * scaleY;
+      
+      const stroke = {
+        x0:    lastX,
+        y0:    lastY,
+        x1:    currentX,
+        y1:    currentY,
+        color: colorPicker.value,
+        size:  parseInt(sizePicker.value),
+      };
+      drawStroke(stroke);
+      [lastX, lastY] = [currentX, currentY];
+    });
+
+    canvas.addEventListener('pointerup',   () => drawing = false);
+    canvas.addEventListener('pointerleave', () => drawing = false);
+    
+    // Touch support
+    canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      lastX = (touch.clientX - rect.left) * scaleX;
+      lastY = (touch.clientY - rect.top) * scaleY;
+      drawing = true;
+    });
+    
+    canvas.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      if (!drawing) return;
+      const touch = e.touches[0];
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const currentX = (touch.clientX - rect.left) * scaleX;
+      const currentY = (touch.clientY - rect.top) * scaleY;
+      
+      const stroke = {
+        x0:    lastX,
+        y0:    lastY,
+        x1:    currentX,
+        y1:    currentY,
+        color: colorPicker.value,
+        size:  parseInt(sizePicker.value),
+      };
+      drawStroke(stroke);
+      [lastX, lastY] = [currentX, currentY];
+    });
+    
+    canvas.addEventListener('touchend', () => drawing = false);
+    canvas.addEventListener('touchcancel', () => drawing = false);
+
+    function clearCanvas() {
+      console.log('🖱️ Clear button clicked');
+      
+      // Clear local canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      console.log('Local canvas cleared');
+      
+      // Send clear command to all clients via gateway
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        const clearMsg = JSON.stringify({ 
+          type: 'clear',
+          timestamp: Date.now()
+        });
+        console.log('📤 Sending clear message:', clearMsg);
+        ws.send(clearMsg);
+        console.log('Clear command sent to gateway');
+      } else {
+        console.log('❌ WebSocket not connected. State:', ws ? ws.readyState : 'no ws');
+      }
+    }
+  </script>
+</body>
+</html>
