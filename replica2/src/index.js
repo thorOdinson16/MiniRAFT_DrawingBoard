@@ -156,7 +156,7 @@ async function sendAppendEntries(peer) {
   // Fast dead-peer probe: skip immediately if known dead, probe cheaply first
   if (!peerAlive[peer]) {
     const probe = new AbortController();
-    const tid   = setTimeout(() => probe.abort(), 50);
+    const tid   = setTimeout(() => probe.abort(), 200);
     try {
       await fetch(`${peer}/status`, { signal: probe.signal });
       peerAlive[peer] = true;
@@ -169,7 +169,7 @@ async function sendAppendEntries(peer) {
 
   inFlight[peer] = true;
   const controller = new AbortController();
-  const timeoutId  = setTimeout(() => controller.abort(), 200);
+  const timeoutId  = setTimeout(() => controller.abort(), 1000);
 
   const from          = nextIndex[peer] ?? log.length;
   const entriesToSend = log.slice(from);
@@ -254,7 +254,9 @@ async function pushSyncLog(peer) {
 let replicationQueue = Promise.resolve();
 
 function replicateStroke(stroke) {
-  replicationQueue = replicationQueue.then(() => _replicateStroke(stroke));
+  replicationQueue = replicationQueue
+    .catch(() => {})  // prevent stuck chain on error
+    .then(() => _replicateStroke(stroke));
   return replicationQueue;
 }
 

@@ -89,7 +89,7 @@ async function forwardToLeader(stroke, maxAttempts = 10) {
         if (data.redirect) {
           currentLeader    = data.redirect;
           isLeaderValid    = true;
-          leaderValidUntil = Date.now() + 5000;
+          leaderValidUntil = Date.now() + 30000;
         } else {
           currentLeader = null;
           isLeaderValid = false;
