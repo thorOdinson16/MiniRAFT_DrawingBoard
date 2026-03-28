@@ -1,26 +1,38 @@
-version: "3.9"
-
 networks:
   raft-net:
     driver: bridge
 
 services:
+
+  # ── Gateway ──────────────────────────────────────────────────────────────────
   gateway:
     build: ./gateway
     container_name: gateway
     ports:
       - "8080:8080"
+      - "8081:8081"
     networks:
       - raft-net
     environment:
       - REPLICAS=http://replica1:4001,http://replica2:4002,http://replica3:4003
-    depends_on:
-      - replica1
-      - replica2
-      - replica3
     volumes:
       - ./gateway/src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      replica1:
+        condition: service_healthy
+      replica2:
+        condition: service_healthy
+      replica3:
+        condition: service_healthy
 
+  # ── Replica 1 ────────────────────────────────────────────────────────────────
   replica1:
     build: ./replica1
     container_name: replica1
@@ -34,7 +46,15 @@ services:
       - PEERS=http://replica2:4002,http://replica3:4003
     volumes:
       - ./replica1/src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4001/status"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 15s
 
+  # ── Replica 2 ────────────────────────────────────────────────────────────────
   replica2:
     build: ./replica2
     container_name: replica2
@@ -48,7 +68,15 @@ services:
       - PEERS=http://replica1:4001,http://replica3:4003
     volumes:
       - ./replica2/src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4002/status"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 15s
 
+  # ── Replica 3 ────────────────────────────────────────────────────────────────
   replica3:
     build: ./replica3
     container_name: replica3
@@ -62,3 +90,10 @@ services:
       - PEERS=http://replica1:4001,http://replica2:4002
     volumes:
       - ./replica3/src:/app/src
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4003/status"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 15s

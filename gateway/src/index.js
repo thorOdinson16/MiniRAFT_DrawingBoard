@@ -1,60 +1,60 @@
 import { WebSocketServer } from 'ws';
-import fetch from 'node-fetch';
-import express from 'express';
+import fetch               from 'node-fetch';
+import express             from 'express';
 
 const REPLICAS = process.env.REPLICAS.split(',');
-const PORT = 8080;
+const WS_PORT  = 8080;
+const HTTP_PORT = 8081;
 
-let currentLeader   = null;
-let isLeaderValid   = false;
+// ── Leader state ──────────────────────────────────────────────────────────────
+let currentLeader          = null;
+let isLeaderValid          = false;
 let leaderDiscoveryPromise = null;
-let leaderValidUntil = 0;
-const clients       = new Set();
+let leaderValidUntil       = 0;
+
+// ── Client & canvas state ─────────────────────────────────────────────────────
+const clients    = new Set();
+const canvasLog  = []; // replay buffer for late-joining clients
 const pendingStrokes = [];
 
-// ─── Canvas state (in-memory replay buffer) ────────────────────────────────
-// Stores all committed strokes so late-joining clients can catch up
-const canvasLog = [];
-
-// ─── Leader discovery ──────────────────────────────────────────────────────
+// ── Leader discovery ───────────────────────────────────────────────────────────
 async function findLeader() {
   for (const url of REPLICAS) {
     try {
-      const res = await fetch(`${url}/status`);
+      const res = await fetch(`${url}/status`, { signal: AbortSignal.timeout(300) });
       if (!res.ok) continue;
       const data = await res.json();
       if (data.role === 'leader') {
         console.log(`[Gateway] Leader found: ${url}`);
         return url;
       }
-    } catch (_) { }
+    } catch (_) { /* replica down — try next */ }
   }
   return null;
 }
 
 async function ensureLeader(retries = 20) {
-  // Fast path: trust current leader for 5s without re-validating
+  // Fast path: reuse cached leader for up to 5 s
   if (currentLeader && isLeaderValid && Date.now() < leaderValidUntil) {
     return currentLeader;
   }
 
-  // Deduplicate: if discovery is already in progress, wait for it
+  // Deduplicate concurrent discovery calls
   if (leaderDiscoveryPromise) return leaderDiscoveryPromise;
 
   leaderDiscoveryPromise = (async () => {
     for (let i = 0; i < retries; i++) {
       const found = await findLeader();
       if (found) {
-        currentLeader = found;
-        isLeaderValid = true;
+        currentLeader    = found;
+        isLeaderValid    = true;
         leaderValidUntil = Date.now() + 5000;
-        console.log(`[Gateway] New leader: ${currentLeader}`);
+        console.log(`[Gateway] Leader set: ${currentLeader}`);
+        // Drain any strokes queued while we had no leader
         if (pendingStrokes.length > 0) {
           console.log(`[Gateway] Draining ${pendingStrokes.length} pending strokes`);
           const toSend = pendingStrokes.splice(0);
-          for (const { stroke } of toSend) {
-            await forwardToLeader(stroke);
-          }
+          for (const stroke of toSend) await forwardToLeader(stroke);
         }
         leaderDiscoveryPromise = null;
         return currentLeader;
@@ -69,70 +69,59 @@ async function ensureLeader(retries = 20) {
   return leaderDiscoveryPromise;
 }
 
-// ─── Forward a stroke to the leader (no recursion — iterative with retries) ─
-async function forwardToLeader(stroke, maxAttempts = 5) {
+// ── Forward stroke to leader ───────────────────────────────────────────────────
+async function forwardToLeader(stroke, maxAttempts = 10) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const leader = await ensureLeader(10);
+    const leader = await ensureLeader(20);
     if (!leader) {
-      console.log(`[Gateway] No leader available, queuing stroke (attempt ${attempt + 1})`);
-      pendingStrokes.push({ stroke });
+      pendingStrokes.push(stroke);
       return false;
     }
-
     try {
       const res = await fetch(`${leader}/stroke`, {
-        method: 'POST',
+        method : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(stroke)
+        body   : JSON.stringify(stroke),
       });
 
       if (res.status === 307) {
         const data = await res.json();
-
         if (data.redirect) {
-          currentLeader = data.redirect;   // ✅ THIS IS KEY
-          isLeaderValid = true;
-          continue;
+          currentLeader    = data.redirect;
+          isLeaderValid    = true;
+          leaderValidUntil = Date.now() + 5000;
+        } else {
+          currentLeader = null;
+          isLeaderValid = false;
         }
-
-        currentLeader = null;
-        isLeaderValid = false;
         continue;
       }
 
       if (!res.ok) {
-        console.log(`[Gateway] Leader returned ${res.status}, re-discovering`);
+        console.log(`[Gateway] Leader ${leader} returned ${res.status} — re-discovering`);
         currentLeader = null;
         isLeaderValid = false;
         continue;
       }
-
       return true;
     } catch (err) {
-      console.log(`[Gateway] Stroke forward failed (${err.message}), attempt ${attempt + 1}`);
-      if (err.name !== 'AbortError') {
-        currentLeader = null;
-        isLeaderValid = false;
-      }
+      console.log(`[Gateway] Forward attempt ${attempt + 1} failed: ${err.message}`);
+      currentLeader = null;
+      isLeaderValid = false;
     }
   }
-
   console.log('[Gateway] Dropped stroke after max attempts');
   return false;
 }
 
-// ─── Broadcast to all WebSocket clients ───────────────────────────────────
+// ── Broadcast to all WebSocket clients ────────────────────────────────────────
 function broadcastToClients(message) {
   const dead = [];
-  let sent = 0;
+  let sent   = 0;
   for (const ws of clients) {
-    if (ws.readyState === 1) {
-      try {
-        ws.send(JSON.stringify(message));
-        sent++;
-      } catch (_) {
-        dead.push(ws);
-      }
+    if (ws.readyState === 1 /* OPEN */) {
+      try { ws.send(JSON.stringify(message)); sent++; }
+      catch (_) { dead.push(ws); }
     } else {
       dead.push(ws);
     }
@@ -141,30 +130,22 @@ function broadcastToClients(message) {
   return sent;
 }
 
-// ─── Replay canvas state to a newly connected client ──────────────────────
+// ── Replay canvas state to a new client ───────────────────────────────────────
 async function replayCanvasToClient(ws) {
   if (canvasLog.length === 0) return;
   console.log(`[Gateway] Replaying ${canvasLog.length} strokes to new client`);
-
-  // Send all strokes in order; batch as fast as possible
   for (const stroke of canvasLog) {
     if (ws.readyState !== 1) break;
-    try {
-      ws.send(JSON.stringify(stroke));
-    } catch (_) {
-      break;
-    }
+    try { ws.send(JSON.stringify(stroke)); } catch (_) { break; }
   }
 }
 
-// ─── WebSocket server ──────────────────────────────────────────────────────
-const wss = new WebSocketServer({ port: PORT });
+// ── WebSocket server ───────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ port: WS_PORT });
 
 wss.on('connection', async (ws) => {
   clients.add(ws);
   console.log(`[Gateway] Client connected (total: ${clients.size})`);
-
-  // Replay existing canvas state to the new client
   await replayCanvasToClient(ws);
 
   ws.on('message', async (raw) => {
@@ -177,12 +158,12 @@ wss.on('connection', async (ws) => {
     }
 
     if (message.type === 'clear') {
-      canvasLog.length = 0; // wipe replay buffer too
+      canvasLog.length = 0;
       broadcastToClients({ type: 'clear' });
       return;
     }
 
-    // Regular stroke — forward to leader
+    // Regular stroke — forward through consensus
     await forwardToLeader(message);
   });
 
@@ -190,48 +171,45 @@ wss.on('connection', async (ws) => {
     clients.delete(ws);
     console.log(`[Gateway] Client disconnected (total: ${clients.size})`);
   });
-
   ws.on('error', () => clients.delete(ws));
 });
 
-// ─── HTTP endpoints (called by replicas) ──────────────────────────────────
+// ── HTTP endpoints (called by replicas) ───────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
+// Called by the leader after committing a stroke — broadcast to all WS clients
 app.post('/broadcast', (req, res) => {
   const stroke = req.body;
-
-  // Store in replay buffer (only regular strokes, not pings/clears)
-  if (stroke && !stroke.type) {
-    canvasLog.push(stroke);
-  }
-
+  if (stroke && !stroke.type) canvasLog.push(stroke); // store for replay
   const sent = broadcastToClients(stroke);
-  console.log(`[Gateway] Broadcast stroke to ${sent} clients (canvas log: ${canvasLog.length})`);
+  console.log(`[Gateway] Broadcast to ${sent} clients (log size: ${canvasLog.length})`);
   res.json({ ok: true, sent });
 });
 
+// Called by a newly elected leader to fast-update gateway cache
 app.post('/leader-announce', (req, res) => {
   const { leader } = req.body;
-  if (!leader) return res.status(400).json({ error: 'No leader provided' });
-
+  if (!leader) return res.status(400).json({ error: 'leader required' });
   console.log(`[Gateway] Leader announced: ${leader}`);
-  currentLeader = leader;
-  isLeaderValid = true;
+  currentLeader    = leader;
+  isLeaderValid    = true;
   leaderValidUntil = Date.now() + 5000;
   leaderDiscoveryPromise = null;
   res.json({ ok: true });
 });
 
+// Healthcheck endpoint used by docker-compose HEALTHCHECK directive
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok',
-    clients: clients.size,
-    leader: currentLeader,
+    status        : 'ok',
+    clients       : clients.size,
+    leader        : currentLeader,
     pendingStrokes: pendingStrokes.length,
-    canvasLogSize: canvasLog.length,
+    canvasLogSize : canvasLog.length,
   });
 });
 
-app.listen(8081, () => console.log('[Gateway] HTTP listener on 8081'));
-console.log(`[Gateway] WebSocket server on ws://localhost:${PORT}`);
+app.listen(HTTP_PORT, () => {
+  console.log(`[Gateway] HTTP on :${HTTP_PORT}  WebSocket on :${WS_PORT}`);
+});

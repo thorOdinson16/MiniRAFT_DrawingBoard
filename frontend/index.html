@@ -2,228 +2,344 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Distributed Drawing Board</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Distributed Drawing Board — Mini-RAFT</title>
   <style>
-    body { margin: 0; background: #1a1a2e; display: flex; flex-direction: column; align-items: center; }
-    h2   { color: #eee; font-family: sans-serif; margin: 12px 0 4px; }
-    #status { color: #aef; font-family: monospace; font-size: 13px; margin-bottom: 8px; }
-    canvas { background: #fff; border-radius: 8px; cursor: crosshair; touch-action: none; }
-    .controls { margin-top: 8px; }
-    button { margin: 4px; padding: 8px 16px; cursor: pointer; border-radius: 6px; border: none; background: #4a90e2; color: #fff; }
-    button:hover { background: #5aa0f2; }
-    input[type=color] { margin: 4px; cursor: pointer; height: 36px; width: 40px; border: none; }
-    input[type=range] { margin: 4px; }
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --border:   #2a2d3a;
+      --text:     #e2e4ef;
+      --muted:    #6b7080;
+      --leader:   #22c55e;
+      --follower: #3b82f6;
+      --candidate:#f59e0b;
+      --dead:     #6b7080;
+      --accent:   #7c3aed;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+      gap: 12px;
+    }
+
+    /* ── Header ── */
+    header {
+      width: 100%;
+      max-width: 960px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 15px; font-weight: 600; letter-spacing: .04em; color: var(--text); }
+    #ws-status {
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      transition: all .3s;
+    }
+    #ws-status.connected    { color: var(--leader);   border-color: var(--leader); }
+    #ws-status.disconnected { color: #ef4444;          border-color: #ef4444; }
+
+    /* ── Cluster dashboard ── */
+    #dashboard {
+      width: 100%;
+      max-width: 960px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .replica-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      transition: border-color .3s;
+    }
+    .replica-card.leader    { border-color: var(--leader);   }
+    .replica-card.follower  { border-color: var(--follower); }
+    .replica-card.candidate { border-color: var(--candidate);}
+    .replica-card.dead      { border-color: var(--dead); opacity: .5; }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-id   { font-size: 13px; font-weight: 600; }
+    .role-badge {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      padding: 2px 8px;
+      border-radius: 12px;
+    }
+    .badge-leader    { background: #14532d; color: var(--leader);   }
+    .badge-follower  { background: #1e3a5f; color: var(--follower); }
+    .badge-candidate { background: #451a03; color: var(--candidate);}
+    .badge-dead      { background: #1c1c1c; color: var(--muted);    }
+
+    .card-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px 12px;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .stat-val { color: var(--text); font-weight: 500; }
+
+    /* ── Canvas + toolbar ── */
+    #canvas-wrap {
+      width: 100%;
+      max-width: 960px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+    }
+    #toolbar label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    input[type=color] { width: 28px; height: 28px; border: none; background: none; cursor: pointer; padding: 0; border-radius: 4px; }
+    input[type=range] { width: 80px; accent-color: var(--accent); }
+    button {
+      font-family: inherit;
+      font-size: 12px;
+      padding: 5px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      transition: background .15s;
+    }
+    button:hover { background: var(--border); }
+    button.danger { border-color: #7f1d1d; color: #ef4444; }
+    button.danger:hover { background: #7f1d1d; }
+
+    canvas {
+      display: block;
+      width: 100%;
+      cursor: crosshair;
+      touch-action: none;
+      background: #ffffff;
+    }
   </style>
 </head>
 <body>
-  <h2>🎨 Distributed Drawing Board (Mini-RAFT)</h2>
-  <div id="status">Connecting...</div>
-  <canvas id="canvas" width="900" height="600"></canvas>
-  <div class="controls">
-    <input type="color" id="color" value="#000000" title="Color" />
-    <input type="range" id="size" min="2" max="30" value="4" title="Brush size" />
-    <button onclick="clearCanvas()">Clear</button>
+
+<header>
+  <h1>🎨 Distributed Drawing Board · Mini-RAFT</h1>
+  <div id="ws-status">Connecting…</div>
+</header>
+
+<!-- Cluster observability dashboard (required by spec §6.2 Observability) -->
+<div id="dashboard">
+  <div class="replica-card dead" id="card-replica1">
+    <div class="card-header">
+      <span class="card-id">replica1</span>
+      <span class="role-badge badge-dead">—</span>
+    </div>
+    <div class="card-stats">
+      <span>term</span>  <span class="stat-val" id="r1-term">—</span>
+      <span>log</span>   <span class="stat-val" id="r1-log">—</span>
+      <span>commit</span><span class="stat-val" id="r1-commit">—</span>
+    </div>
   </div>
+  <div class="replica-card dead" id="card-replica2">
+    <div class="card-header">
+      <span class="card-id">replica2</span>
+      <span class="role-badge badge-dead">—</span>
+    </div>
+    <div class="card-stats">
+      <span>term</span>  <span class="stat-val" id="r2-term">—</span>
+      <span>log</span>   <span class="stat-val" id="r2-log">—</span>
+      <span>commit</span><span class="stat-val" id="r2-commit">—</span>
+    </div>
+  </div>
+  <div class="replica-card dead" id="card-replica3">
+    <div class="card-header">
+      <span class="card-id">replica3</span>
+      <span class="role-badge badge-dead">—</span>
+    </div>
+    <div class="card-stats">
+      <span>term</span>  <span class="stat-val" id="r3-term">—</span>
+      <span>log</span>   <span class="stat-val" id="r3-log">—</span>
+      <span>commit</span><span class="stat-val" id="r3-commit">—</span>
+    </div>
+  </div>
+</div>
 
-  <script>
-    const canvas = document.getElementById('canvas');
-    const ctx    = canvas.getContext('2d');
-    const status = document.getElementById('status');
-    const colorPicker = document.getElementById('color');
-    const sizePicker  = document.getElementById('size');
+<!-- Drawing canvas -->
+<div id="canvas-wrap">
+  <div id="toolbar">
+    <label>Color <input type="color" id="color" value="#000000"></label>
+    <label>Size  <input type="range"  id="size" min="2" max="30" value="4"></label>
+    <button onclick="setEraser()">Eraser</button>
+    <button class="danger" onclick="clearCanvas()">Clear All</button>
+  </div>
+  <canvas id="canvas" width="960" height="560"></canvas>
+</div>
 
-    let drawing = false;
-    let lastX = 0, lastY = 0;
-    let reconnectAttempts = 0;
-    let heartbeatInterval = null;
+<script>
+// ── Canvas setup ──────────────────────────────────────────────────────────────
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const colorPicker = document.getElementById('color');
+const sizePicker  = document.getElementById('size');
+const wsStatus    = document.getElementById('ws-status');
 
-    // ─── WebSocket with heartbeat ───────────────────────────────────────────
-    let ws;
-    function connect() {
-      ws = new WebSocket('ws://localhost:8080');
-      
-      // Clear heartbeat if exists
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-      }
+let drawing = false;
+let lastX = 0, lastY = 0;
+let eraserMode = false;
 
-      ws.onopen = () => {
-        status.textContent = '✅ Connected to Gateway';
-        status.style.color = '#aef';
-        reconnectAttempts = 0;
-        
-        // Send heartbeat every 30 seconds
-        heartbeatInterval = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
-          }
-        }, 30000);
-      };
+function setEraser() { eraserMode = true; colorPicker.value = '#ffffff'; }
+colorPicker.addEventListener('input', () => { eraserMode = false; });
 
-      ws.onclose = () => {
-        status.textContent = '🔴 Disconnected — reconnecting...';
-        status.style.color = '#faa';
-        if (heartbeatInterval) {
-          clearInterval(heartbeatInterval);
-          heartbeatInterval = null;
-        }
-        
-        reconnectAttempts++;
-        const delay = Math.min(5000, 1000 * Math.pow(2, reconnectAttempts));
-        setTimeout(connect, delay);
-      };
+// ── WebSocket with exponential-backoff reconnect ──────────────────────────────
+let ws;
+let reconnectAttempts = 0;
+let heartbeatInterval = null;
 
-      ws.onerror = () => {
-        status.textContent = '⚠️ Connection error';
-        status.style.color = '#fa0';
-      };
+function connect() {
+  ws = new WebSocket('ws://localhost:8080');
 
-      ws.onmessage = ({ data }) => {
-        console.log('Received message:', data); // DEBUG: See all messages
-        
-        try {
-          const message = JSON.parse(data);
-          console.log('Parsed message:', message); // DEBUG: See parsed message
-          
-          // Handle ping responses
-          if (message.type === 'pong') {
-            console.log('Received pong');
-            return;
-          }
-          
-          // Handle clear command
-          if (message.type === 'clear') {
-            console.log('🔵 CLEAR COMMAND RECEIVED! Clearing canvas...');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            console.log('Canvas cleared by remote user');
-            return;
-          }
-          
-          // Handle regular stroke
-          drawStroke(message, false);
-        } catch (e) {
-          console.error('Error parsing message:', e);
-          // Handle legacy format or errors
-          try {
-            const stroke = JSON.parse(data);
-            drawStroke(stroke, false);
-          } catch (err) {
-            console.error('Invalid message:', data);
-          }
-        }
-      };
-    }
-    connect();
+  if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
 
-    // ─── Drawing ────────────────────────────────────────────────────────────
-    function drawStroke(stroke, send = true) {
-      ctx.beginPath();
-      ctx.moveTo(stroke.x0, stroke.y0);
-      ctx.lineTo(stroke.x1, stroke.y1);
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth   = stroke.size;
-      ctx.lineCap     = 'round';
-      ctx.lineJoin    = 'round';
-      ctx.stroke();
+  ws.onopen = () => {
+    wsStatus.textContent = 'Connected';
+    wsStatus.className   = 'connected';
+    reconnectAttempts    = 0;
+    heartbeatInterval    = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+    }, 30000);
+  };
 
-      if (send && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(stroke));
-      }
-    }
+  ws.onclose = () => {
+    wsStatus.textContent = 'Reconnecting…';
+    wsStatus.className   = 'disconnected';
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    reconnectAttempts++;
+    setTimeout(connect, Math.min(8000, 500 * Math.pow(2, reconnectAttempts)));
+  };
 
-    canvas.addEventListener('pointerdown', (e) => {
-      drawing = true;
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      lastX = (e.clientX - rect.left) * scaleX;
-      lastY = (e.clientY - rect.top) * scaleY;
-      e.preventDefault();
-    });
+  ws.onerror = () => { wsStatus.textContent = 'Error'; wsStatus.className = 'disconnected'; };
 
-    canvas.addEventListener('pointermove', (e) => {
-      if (!drawing) return;
-      e.preventDefault();
-      
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const currentX = (e.clientX - rect.left) * scaleX;
-      const currentY = (e.clientY - rect.top) * scaleY;
-      
-      const stroke = {
-        x0:    lastX,
-        y0:    lastY,
-        x1:    currentX,
-        y1:    currentY,
-        color: colorPicker.value,
-        size:  parseInt(sizePicker.value),
-      };
-      drawStroke(stroke);
-      [lastX, lastY] = [currentX, currentY];
-    });
+  ws.onmessage = ({ data }) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === 'pong')  return;
+      if (msg.type === 'clear') { ctx.clearRect(0, 0, canvas.width, canvas.height); return; }
+      drawStroke(msg, false);
+    } catch (_) {}
+  };
+}
+connect();
 
-    canvas.addEventListener('pointerup',   () => drawing = false);
-    canvas.addEventListener('pointerleave', () => drawing = false);
-    
-    // Touch support
-    canvas.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      const touch = e.touches[0];
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      lastX = (touch.clientX - rect.left) * scaleX;
-      lastY = (touch.clientY - rect.top) * scaleY;
-      drawing = true;
-    });
-    
-    canvas.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-      if (!drawing) return;
-      const touch = e.touches[0];
-      const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width;
-      const scaleY = canvas.height / rect.height;
-      const currentX = (touch.clientX - rect.left) * scaleX;
-      const currentY = (touch.clientY - rect.top) * scaleY;
-      
-      const stroke = {
-        x0:    lastX,
-        y0:    lastY,
-        x1:    currentX,
-        y1:    currentY,
-        color: colorPicker.value,
-        size:  parseInt(sizePicker.value),
-      };
-      drawStroke(stroke);
-      [lastX, lastY] = [currentX, currentY];
-    });
-    
-    canvas.addEventListener('touchend', () => drawing = false);
-    canvas.addEventListener('touchcancel', () => drawing = false);
+// ── Drawing ───────────────────────────────────────────────────────────────────
+function drawStroke(stroke, send = true) {
+  ctx.beginPath();
+  ctx.moveTo(stroke.x0, stroke.y0);
+  ctx.lineTo(stroke.x1, stroke.y1);
+  ctx.strokeStyle = stroke.color;
+  ctx.lineWidth   = stroke.size;
+  ctx.lineCap     = 'round';
+  ctx.lineJoin    = 'round';
+  ctx.stroke();
+  if (send && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(stroke));
+}
 
-    function clearCanvas() {
-      console.log('🖱️ Clear button clicked');
-      
-      // Clear local canvas
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      console.log('Local canvas cleared');
-      
-      // Send clear command to all clients via gateway
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const clearMsg = JSON.stringify({ 
-          type: 'clear',
-          timestamp: Date.now()
-        });
-        console.log('📤 Sending clear message:', clearMsg);
-        ws.send(clearMsg);
-        console.log('Clear command sent to gateway');
-      } else {
-        console.log('❌ WebSocket not connected. State:', ws ? ws.readyState : 'no ws');
-      }
-    }
-  </script>
+function getPos(e) {
+  const rect   = canvas.getBoundingClientRect();
+  const scaleX = canvas.width  / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (e.clientX - rect.left) * scaleX,
+    y: (e.clientY - rect.top)  * scaleY,
+  };
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  drawing = true;
+  const p = getPos(e);
+  lastX = p.x; lastY = p.y;
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  e.preventDefault();
+  const p = getPos(e);
+  drawStroke({ x0: lastX, y0: lastY, x1: p.x, y1: p.y,
+               color: colorPicker.value, size: parseInt(sizePicker.value) });
+  lastX = p.x; lastY = p.y;
+});
+canvas.addEventListener('pointerup',    () => drawing = false);
+canvas.addEventListener('pointerleave', () => drawing = false);
+
+function clearCanvas() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: 'clear', timestamp: Date.now() }));
+}
+
+// ── Cluster status dashboard ──────────────────────────────────────────────────
+// Polls each replica's /status every 1.5 s to show leader/term/log size.
+// Required by spec §6.2 Observability.
+const REPLICAS = [
+  { id: 'replica1', url: 'http://localhost:4001', prefix: 'r1' },
+  { id: 'replica2', url: 'http://localhost:4002', prefix: 'r2' },
+  { id: 'replica3', url: 'http://localhost:4003', prefix: 'r3' },
+];
+
+async function pollReplica({ id, url, prefix }) {
+  const card  = document.getElementById(`card-${id}`);
+  const badge = card.querySelector('.role-badge');
+  try {
+    const res  = await fetch(`${url}/status`, { signal: AbortSignal.timeout(800) });
+    const data = await res.json();
+
+    const role = data.role || 'unknown';
+    card.className  = `replica-card ${role}`;
+    badge.className = `role-badge badge-${role}`;
+    badge.textContent = role.toUpperCase();
+
+    document.getElementById(`${prefix}-term`).textContent   = data.term ?? '—';
+    document.getElementById(`${prefix}-log`).textContent    = data.logLength ?? '—';
+    document.getElementById(`${prefix}-commit`).textContent = data.commitIndex ?? '—';
+  } catch (_) {
+    card.className    = 'replica-card dead';
+    badge.className   = 'role-badge badge-dead';
+    badge.textContent = 'DEAD';
+    document.getElementById(`${prefix}-term`).textContent   = '—';
+    document.getElementById(`${prefix}-log`).textContent    = '—';
+    document.getElementById(`${prefix}-commit`).textContent = '—';
+  }
+}
+
+function pollAll() { REPLICAS.forEach(r => pollReplica(r)); }
+pollAll();
+setInterval(pollAll, 1500);
+</script>
 </body>
 </html>
