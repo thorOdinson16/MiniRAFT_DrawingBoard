@@ -157,13 +157,7 @@ wss.on('connection', async (ws) => {
       return;
     }
 
-    if (message.type === 'clear') {
-      canvasLog.length = 0;
-      broadcastToClients({ type: 'clear' });
-      return;
-    }
-
-    // Regular stroke — forward through consensus
+    // All messages (including clear) go through Raft consensus for ordering
     await forwardToLeader(message);
   });
 
@@ -180,9 +174,16 @@ app.use(express.json({ limit: '1mb' }));
 
 // Called by the leader after committing a stroke — broadcast to all WS clients
 app.post('/broadcast', (req, res) => {
-  const stroke = req.body;
-  if (stroke && !stroke.type) canvasLog.push(stroke); // store for replay
-  const sent = broadcastToClients(stroke);
+  const message = req.body;
+  if (message.type === 'clear') {
+    canvasLog.length = 0;
+    broadcastToClients({ type: 'clear' });
+    console.log(`[Gateway] Broadcast CLEAR to clients`);
+    res.json({ ok: true, sent: clients.size });
+    return;
+  }
+  if (message && !message.type) canvasLog.push(message);
+  const sent = broadcastToClients(message);
   console.log(`[Gateway] Broadcast to ${sent} clients (log size: ${canvasLog.length})`);
   res.json({ ok: true, sent });
 });

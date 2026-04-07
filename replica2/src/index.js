@@ -24,10 +24,12 @@ let isShuttingDown    = false;
 let lastCommittedIndex = -1;
 
 // Per-peer replication tracking
-const nextIndex  = {};
-const inFlight   = {};
-const peerAlive  = {};
-PEERS.forEach(p => { nextIndex[p] = 0; inFlight[p] = false; peerAlive[p] = true; });
+const nextIndex     = {};
+const inFlight      = {};
+const peerAlive     = {};
+const peerDeadSince = {};
+const PEER_DEAD_COOLDOWN_MS = 3000;
+PEERS.forEach(p => { nextIndex[p] = 0; inFlight[p] = false; peerAlive[p] = true; peerDeadSince[p] = null; });
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 function log_msg(...args) {
@@ -153,6 +155,14 @@ async function sendAppendEntries(peer) {
   if (isShuttingDown)  return { success: false };
   if (inFlight[peer])  return { success: false };
 
+  // Skip peer in cooldown period (dead for PEER_DEAD_COOLDOWN_MS)
+  if (!peerAlive[peer] && peerDeadSince[peer]) {
+    const now = Date.now();
+    if (now - peerDeadSince[peer] < PEER_DEAD_COOLDOWN_MS) {
+      return { success: false };
+    }
+  }
+
   // Fast dead-peer probe: skip immediately if known dead, probe cheaply first
   if (!peerAlive[peer]) {
     const probe = new AbortController();
@@ -217,6 +227,7 @@ async function sendAppendEntries(peer) {
   } catch (_) {
     clearTimeout(timeoutId);
     peerAlive[peer] = false;
+    peerDeadSince[peer] = Date.now();
     return { success: false };
   } finally {
     inFlight[peer] = false;
@@ -249,25 +260,25 @@ async function pushSyncLog(peer) {
   }
 }
 
-// ── Stroke replication ────────────────────────────────────────────────────────
+// ── Message replication (strokes and clear) ────────────────────────────────────
 // Serialised queue so concurrent HTTP requests don't interleave log entries.
 let replicationQueue = Promise.resolve();
 
-function replicateStroke(stroke) {
+function replicateMessage(message) {
   replicationQueue = replicationQueue
     .catch(() => {})  // prevent stuck chain on error
-    .then(() => _replicateStroke(stroke));
+    .then(() => _replicateMessage(message));
   return replicationQueue;
 }
 
-async function _replicateStroke(stroke) {
+async function _replicateMessage(message) {
   if (role !== 'leader') return false;
 
-  const entry = { term: currentTerm, index: log.length, data: stroke };
+  const entry = { term: currentTerm, index: log.length, data: message };
   log.push(entry);
 
   const majority = Math.floor((PEERS.length + 1) / 2) + 1;
-  let acks      = 1;   // self-ack
+  let acks      = 1;
   let committed = false;
 
   await Promise.all(PEERS.map(async (peer) => {
@@ -276,21 +287,20 @@ async function _replicateStroke(stroke) {
       acks++;
       if (acks >= majority && !committed) {
         committed = true;
-        await commitAndBroadcast(entry, stroke);
+        await commitAndBroadcast(entry, message);
       }
     }
   }));
 
   if (!committed) {
-    // Roll back the uncommitted entry
     log.pop();
-    PEERS.forEach(p => { nextIndex[p] = log.length; });
+    PEERS.forEach(p => { nextIndex[p] = log.length; peerAlive[p] = true; });
     log_msg(`No majority for index=${entry.index} — rolled back`);
   }
   return committed;
 }
 
-async function commitAndBroadcast(entry, stroke) {
+async function commitAndBroadcast(entry, message) {
   if (entry.index <= lastCommittedIndex) return;
   lastCommittedIndex = entry.index;
   commitIndex        = Math.max(commitIndex, entry.index);
@@ -298,7 +308,7 @@ async function commitAndBroadcast(entry, stroke) {
     await fetch(`${GATEWAY_URL}/broadcast`, {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify(stroke),
+      body   : JSON.stringify(message),
     });
   } catch (err) {
     log_msg(`Broadcast failed: ${err.message}`);
@@ -322,13 +332,12 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Stroke entry-point (leader only; followers redirect)
+// Message entry-point (leader only; followers redirect)
 app.post('/stroke', async (req, res) => {
   if (role !== 'leader') {
-    // Tell gateway exactly who the current leader is so it can update fast
     return res.status(307).json({ redirect: leaderId });
   }
-  const ok = await replicateStroke(req.body);
+  const ok = await replicateMessage(req.body);
   res.json({ ok });
 });
 
