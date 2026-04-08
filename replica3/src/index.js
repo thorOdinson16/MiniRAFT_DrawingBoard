@@ -50,12 +50,11 @@ function stopElectionTimer() {
 function becomeFollower(term, leader = null) {
   if (term < currentTerm) return;
   const changed = term > currentTerm || leader !== leaderId || role !== 'follower';
-  // Stop heartbeat if we were leader
   clearInterval(heartbeatTimer);
   heartbeatTimer = null;
   role        = 'follower';
+  if (term > currentTerm) votedFor = null;  // ← only reset on new term
   currentTerm = term;
-  votedFor    = null;
   leaderId    = leader;
   if (changed) log_msg(`→ FOLLOWER (term=${term}, leader=${leader})`);
   resetElectionTimer();
@@ -67,13 +66,12 @@ async function becomeLeader() {
   role     = 'leader';
   leaderId = `http://${REPLICA_ID}:${PORT}`;
   stopElectionTimer();
-  // Initialise per-peer nextIndex to end of our log
   PEERS.forEach(p => { nextIndex[p] = log.length; peerAlive[p] = true; });
-  // Immediately send heartbeats so followers don't start another election
   sendHeartbeats();
   heartbeatTimer = setInterval(sendHeartbeats, HEARTBEAT_MS);
-  // Announce to gateway (retry 3 times)
+
   for (let i = 0; i < 3; i++) {
+    if (role !== 'leader') return;  // ← ADD THIS CHECK
     try {
       await fetch(`${GATEWAY_URL}/leader-announce`, {
         method : 'POST',
@@ -102,11 +100,17 @@ async function startElection() {
 
   if (votes >= majority && role === 'candidate' && !isShuttingDown) {
     await becomeLeader();
-  } else if (role === 'candidate') {
+  } 
+  else if (role === 'candidate') {
     log_msg(`Election lost (${votes} votes, need ${majority}). Backing off.`);
-    // Random back-off before retrying to avoid split-vote loops
-    await new Promise(r => setTimeout(r, 150 + Math.random() * 150));
-    becomeFollower(currentTerm);
+    const termAtLoss = currentTerm;
+    await new Promise(r => setTimeout(r, 300 + Math.random() * 500));
+    // Only step back if nothing updated our term during the backoff
+    if (currentTerm === termAtLoss) {
+      becomeFollower(currentTerm - 1);
+    } else {
+      becomeFollower(currentTerm); // already updated, just ensure follower state
+    }
   }
 }
 
@@ -149,16 +153,36 @@ async function requestVotes() {
 // ── Heartbeats / AppendEntries ─────────────────────────────────────────────────
 async function sendHeartbeats() {
   if (role !== 'leader' || isShuttingDown) return;
-
   for (const peer of PEERS) {
-    sendAppendEntries(peer);
+    // Always send heartbeat regardless of peerAlive status
+    sendHeartbeatToPeer(peer);
+  }
+}
+
+async function sendHeartbeatToPeer(peer) {
+  if (isShuttingDown) return;
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), 300);
+  try {
+    await fetch(`${peer}/heartbeat`, {
+      method : 'POST',
+      signal : controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ term: currentTerm, leaderId: `http://${REPLICA_ID}:${PORT}` }),
+    });
+    peerAlive[peer] = true;
+    peerDeadSince[peer] = null;
+  } catch (_) {
+    peerAlive[peer] = false;
+    peerDeadSince[peer] = Date.now();
+  } finally {
+    clearTimeout(tid);
   }
 }
 
 async function sendAppendEntries(peer) {
-  if (isShuttingDown)  return { success: false };
+  if (isShuttingDown) return { success: false };
 
-  // Skip peer in cooldown period (dead for PEER_DEAD_COOLDOWN_MS)
   if (!peerAlive[peer] && peerDeadSince[peer]) {
     const now = Date.now();
     if (now - peerDeadSince[peer] < PEER_DEAD_COOLDOWN_MS) {
@@ -166,13 +190,13 @@ async function sendAppendEntries(peer) {
     }
   }
 
-  // Fast dead-peer probe: skip immediately if known dead, probe cheaply first
   if (!peerAlive[peer]) {
     const probe = new AbortController();
     const tid   = setTimeout(() => probe.abort(), 200);
     try {
       await fetch(`${peer}/status`, { signal: probe.signal });
       peerAlive[peer] = true;
+      peerDeadSince[peer] = null;
     } catch (_) {
       clearTimeout(tid);
       return { success: false };
@@ -208,73 +232,14 @@ async function sendAppendEntries(peer) {
     peerAlive[peer] = true;
     const data = await res.json();
 
-    // Higher term discovered → step down immediately
     if (data.term > currentTerm) {
       becomeFollower(data.term);
       return { success: false };
     }
 
     if (!data.success) {
-      // Follower log doesn't match — back off and push a full sync
-      const followerLen    = data.logLength ?? 0;
-      nextIndex[peer]      = Math.max(0, Math.min((nextIndex[peer] ?? 1) - 1, followerLen));
-      let attempts = 0;
-
-      while (attempts < 10) {
-        attempts++;
-
-        const from = nextIndex[peer] ?? 0;
-        const prevLogIndex = from - 1;
-        const prevLog = prevLogIndex >= 0 ? log[prevLogIndex] : null;
-
-        const body = {
-          term: currentTerm,
-          leaderId: `http://${REPLICA_ID}:${PORT}`,
-          prevLogIndex: prevLog ? prevLog.index : -1,
-          prevLogTerm: prevLog ? prevLog.term : -1,
-          entries: log.slice(from),
-          leaderCommit: commitIndex,
-        };
-
-        try {
-          const controller = new AbortController();
-          const tid = setTimeout(() => controller.abort(), 1000);
-
-          const res = await fetch(`${peer}/append-entries`, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-
-          clearTimeout(tid);
-
-          const data = await res.json();
-
-          if (data.term > currentTerm) {
-            becomeFollower(data.term);
-            return { success: false };
-          }
-
-          if (data.success) {
-            nextIndex[peer] = log.length;
-            return { success: true };
-          }
-
-          // backtrack
-          nextIndex[peer] = Math.max(0, (nextIndex[peer] ?? 1) - 1);
-
-          if (nextIndex[peer] === 0) {
-            return { success: false };
-          }
-
-        } catch (_) {
-          peerAlive[peer] = false;
-          peerDeadSince[peer] = Date.now();
-          return { success: false };
-        }
-      }
-
+      // Log mismatch — use sync-log to do a full catch-up instead of backtracking
+      await pushSyncLog(peer);
       return { success: false };
     }
 
@@ -294,23 +259,32 @@ async function sendAppendEntries(peer) {
 // Spec §4 Catch-Up: leader calls /sync-log on the follower with all entries
 // from its current log length onward.
 async function pushSyncLog(peer) {
+  // Always push everything from the follower's known position to end of log
   const from    = nextIndex[peer] ?? 0;
   const missing = log.slice(from);
   if (missing.length === 0) return;
 
   const controller = new AbortController();
-  const tid        = setTimeout(() => controller.abort(), 500);
+  const tid        = setTimeout(() => controller.abort(), 1000); // ← increased timeout
   try {
-    await fetch(`${peer}/sync-log`, {
+    const res = await fetch(`${peer}/sync-log`, {
       method : 'POST',
       signal : controller.signal,
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({ entries: missing, leaderCommit: commitIndex, term: currentTerm }),
     });
-    nextIndex[peer] = Math.max(nextIndex[peer], log.length);
-    log_msg(`sync-log → ${peer}: pushed ${missing.length} entries`);
+    clearTimeout(tid);
+    const data = await res.json();
+    // Update nextIndex to reflect follower is now caught up
+    if (data.ok) {
+      nextIndex[peer] = log.length;
+      peerAlive[peer] = true;
+      peerDeadSince[peer] = null;
+      log_msg(`sync-log → ${peer}: pushed ${missing.length} entries, follower now at ${data.logLength}`);
+    }
   } catch (_) {
-    // will retry on next heartbeat cycle
+    peerAlive[peer] = false;
+    peerDeadSince[peer] = Date.now();
   } finally {
     clearTimeout(tid);
   }
@@ -337,29 +311,31 @@ async function _replicateMessage(message) {
   let acks      = 1;
   let committed = false;
 
-  // Fire replication WITHOUT blocking on all peers
-  for (const peer of PEERS) {
-    sendAppendEntries(peer).then(async (result) => {
-      if (result?.success) {
-        acks++;
-
-        if (acks >= majority && !committed) {
-          committed = true;
-          await commitAndBroadcast(entry, message);
-        }
-      }
-    }).catch(() => {
-      // ignore failures (dead nodes)
-    });
-  }
-  setTimeout(() => {
-    if (!committed && role === 'leader') {
-      log_msg(`Still waiting for majority index=${entry.index}`);
-      for (const peer of PEERS) {
-        sendAppendEntries(peer);
+  const tryCommit = async (peer) => {
+    const result = await sendAppendEntries(peer).catch(() => null);
+    if (result?.success && !committed) {
+      acks++;
+      if (acks >= majority) {
+        committed = true;
+        await commitAndBroadcast(entry, message);
       }
     }
-  }, 300);
+  };
+
+  for (const peer of PEERS) tryCommit(peer);
+
+  // Single retry interval per entry — clears itself once committed
+  const retryInterval = setInterval(async () => {
+    if (committed || role !== 'leader') {
+      clearInterval(retryInterval);
+      return;
+    }
+    // Only log if this entry is still the frontier (avoid log spam for old entries)
+    if (entry.index >= lastCommittedIndex) {
+      log_msg(`Still waiting for majority index=${entry.index}`);
+    }
+    for (const peer of PEERS) tryCommit(peer);
+  }, 500); // ← increased from 300ms to reduce interval pile-up pressure
 }
 
 async function commitAndBroadcast(entry, message) {
@@ -406,6 +382,10 @@ app.post('/stroke', async (req, res) => {
 // RAFT: RequestVote RPC
 app.post('/request-vote', (req, res) => {
   const { term, candidateId, lastLogIndex, lastLogTerm } = req.body;
+
+  if (role === 'leader' && term <= currentTerm) {
+    return res.json({ term: currentTerm, voteGranted: false });
+  }
 
   // Higher term always wins
   if (term > currentTerm) becomeFollower(term);
