@@ -4,6 +4,21 @@ networks:
 
 services:
 
+  # ── Frontend ──────────────────────────────────────────────────────────────────
+  frontend:
+    image: nginx:alpine
+    container_name: frontend
+    ports:
+      - "3000:80"
+    networks:
+      - raft-net
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+
   # ── Gateway ──────────────────────────────────────────────────────────────────
   gateway:
     build: ./gateway

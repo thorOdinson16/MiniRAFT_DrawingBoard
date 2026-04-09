@@ -26,13 +26,12 @@ let isShuttingDown     = false;
 
 // Per-peer replication tracking (canonical RAFT: nextIndex + matchIndex)
 const nextIndex     = {};
-const matchIndex    = {};   // FIX: was missing — tracks highest index confirmed on each peer
+const matchIndex    = {};
 const peerAlive     = {};
 const peerDeadSince = {};
 
-// Total cluster size is always PEERS + self (never changes even when peers die)
 const CLUSTER_SIZE = PEERS.length + 1;
-const MAJORITY     = Math.floor(CLUSTER_SIZE / 2) + 1; // e.g. 2 for a 3-node cluster
+const MAJORITY     = Math.floor(CLUSTER_SIZE / 2) + 1;
 
 PEERS.forEach(p => {
   nextIndex[p]     = 0;
@@ -79,25 +78,19 @@ async function becomeLeader() {
   leaderId = `http://${REPLICA_ID}:${PORT}`;
   stopElectionTimer();
 
-  // FIX: initialise both nextIndex AND matchIndex on every election
   PEERS.forEach(p => {
     nextIndex[p]     = log.length;
-    matchIndex[p]    = -1;   // we don't know what peers have confirmed yet
+    matchIndex[p]    = -1;
     peerAlive[p]     = true;
     peerDeadSince[p] = null;
   });
 
-  // FIX: append a no-op entry in the current term so that inherited uncommitted
-  // entries from the previous leader's term get committed via the no-op commit
-  // (canonical RAFT §5.4.2 — leader can only commit entries from its own term)
   const noop = { term: currentTerm, index: log.length, data: { type: 'noop' } };
   log.push(noop);
 
-  // Start heartbeats immediately so followers don't call another election
   sendHeartbeats();
   heartbeatTimer = setInterval(sendHeartbeats, HEARTBEAT_MS);
 
-  // Announce to gateway (with retries)
   for (let i = 0; i < 3; i++) {
     if (role !== 'leader') return;
     try {
@@ -113,7 +106,6 @@ async function becomeLeader() {
     }
   }
 
-  // FIX: replicate the no-op to commit it (and thereby commit all inherited entries)
   await _replicateEntry(noop, { type: 'noop' });
 }
 
@@ -126,7 +118,7 @@ async function startElection() {
   leaderId    = null;
   log_msg(`Starting election for term ${currentTerm}`);
 
-  const votes    = await requestVotes();
+  const votes = await requestVotes();
 
   if (votes >= MAJORITY && role === 'candidate' && !isShuttingDown) {
     await becomeLeader();
@@ -197,10 +189,14 @@ async function sendHeartbeatToPeer(peer) {
     });
     clearTimeout(tid);
     const data = await res.json();
-    // If a peer reports a higher term, we are a stale leader — step down immediately
+    // FIX: if the peer reports a higher term we are a stale leader — step down
+    // immediately and return so we do NOT mark the peer as alive while we are
+    // no longer leader (previously the peerAlive assignment ran unconditionally
+    // after becomeFollower, corrupting leader-only state).
     if (data.term > currentTerm) {
-      log_msg(`Stale leader detected via heartbeat response from ${peer} (their term=${data.term})`);
+      log_msg(`Stale leader detected via heartbeat from ${peer} (their term=${data.term})`);
       becomeFollower(data.term);
+      return; // <-- FIX: stop here; do not touch peerAlive as a follower
     }
     peerAlive[peer]     = true;
     peerDeadSince[peer] = null;
@@ -216,14 +212,12 @@ async function sendHeartbeatToPeer(peer) {
 async function sendAppendEntries(peer) {
   if (isShuttingDown) return { success: false };
 
-  // Skip dead peers during cooldown — but still attempt after cooldown expires
   if (!peerAlive[peer] && peerDeadSince[peer]) {
     if (Date.now() - peerDeadSince[peer] < PEER_DEAD_COOLDOWN_MS) {
       return { success: false };
     }
   }
 
-  // Probe dead peer before sending real RPC
   if (!peerAlive[peer]) {
     const probe = new AbortController();
     const tid   = setTimeout(() => probe.abort(), 200);
@@ -242,7 +236,7 @@ async function sendAppendEntries(peer) {
   const controller = new AbortController();
   const timeoutId  = setTimeout(() => controller.abort(), 2000);
 
-  const from         = nextIndex[peer] ?? 0;
+  const from          = nextIndex[peer] ?? 0;
   const entriesToSend = log.slice(from);
   const prevLogIndex  = from - 1;
   const prevLog       = prevLogIndex >= 0 ? log[prevLogIndex] : null;
@@ -273,8 +267,6 @@ async function sendAppendEntries(peer) {
     }
 
     if (!data.success) {
-      // FIX: use the follower's actual reported log length to set nextIndex
-      // (not our stale nextIndex value) before calling sync-log
       if (typeof data.logLength === 'number') {
         nextIndex[peer] = data.logLength;
       } else {
@@ -284,11 +276,10 @@ async function sendAppendEntries(peer) {
       return { success: false };
     }
 
-    // FIX: update BOTH nextIndex and matchIndex on success
     if (entriesToSend.length > 0) {
-      const ackedIndex    = entriesToSend[entriesToSend.length - 1].index;
-      matchIndex[peer]    = Math.max(matchIndex[peer] ?? -1, ackedIndex);
-      nextIndex[peer]     = ackedIndex + 1;
+      const ackedIndex = entriesToSend[entriesToSend.length - 1].index;
+      matchIndex[peer] = Math.max(matchIndex[peer] ?? -1, ackedIndex);
+      nextIndex[peer]  = ackedIndex + 1;
     }
 
     return { success: true, peer };
@@ -318,7 +309,6 @@ async function pushSyncLog(peer) {
     clearTimeout(tid);
     const data = await res.json();
     if (data.ok) {
-      // FIX: update both nextIndex AND matchIndex after successful sync
       const lastSynced    = missing[missing.length - 1].index;
       nextIndex[peer]     = lastSynced + 1;
       matchIndex[peer]    = Math.max(matchIndex[peer] ?? -1, lastSynced);
@@ -335,26 +325,18 @@ async function pushSyncLog(peer) {
 }
 
 // ── Advance commitIndex using matchIndex (canonical RAFT §5.3) ────────────────
-// FIX: replaces the old per-message ack counter approach entirely.
-// After any successful AppendEntries, check if any new index has been
-// confirmed on a majority of nodes and can now be committed.
 function tryAdvanceCommitIndex() {
   if (role !== 'leader') return;
 
-  // Walk backwards from the end of the log to find the highest N where:
-  //   1. log[N].term === currentTerm  (safety: only commit own-term entries)
-  //   2. majority of nodes have matchIndex >= N
   for (let n = log.length - 1; n > commitIndex; n--) {
-    if (log[n].term !== currentTerm) continue; // never commit previous-term entries directly
+    if (log[n].term !== currentTerm) continue;
 
-    // Count nodes that have confirmed index n: self (leader always has it) + peers
     let count = 1;
     for (const peer of PEERS) {
       if ((matchIndex[peer] ?? -1) >= n) count++;
     }
 
     if (count >= MAJORITY) {
-      // Commit everything up to n
       for (let i = commitIndex + 1; i <= n; i++) {
         commitIndex        = i;
         lastCommittedIndex = i;
@@ -398,28 +380,14 @@ function replicateMessage(message) {
 async function _replicateEntry(entry, message) {
   if (role !== 'leader') return false;
 
-  // Fire AppendEntries to all peers concurrently; update matchIndex on success
-  const results = await Promise.allSettled(
-    PEERS.map(peer => sendAppendEntries(peer))
-  );
-
-  // Update matchIndex from results and check if we can now commit
-  for (const result of results) {
-    if (result.status === 'fulfilled' && result.value?.success) {
-      // matchIndex was already updated inside sendAppendEntries
-    }
-  }
-
-  // FIX: use matchIndex-based commit check instead of counting acks in closure
+  await Promise.allSettled(PEERS.map(peer => sendAppendEntries(peer)));
   tryAdvanceCommitIndex();
 
-  // If not yet committed (e.g. some peers were dead), keep retrying
   const retryInterval = setInterval(async () => {
     if (role !== 'leader' || isShuttingDown) {
       clearInterval(retryInterval);
       return;
     }
-    // FIX: stop retrying if this entry was already committed (by any path)
     if (entry.index <= commitIndex) {
       clearInterval(retryInterval);
       return;
@@ -431,7 +399,6 @@ async function _replicateEntry(entry, message) {
     tryAdvanceCommitIndex();
   }, 500);
 
-  // Safety: clear the retry interval after 30 s to avoid infinite leaks
   setTimeout(() => clearInterval(retryInterval), 30000);
 
   return true;
@@ -441,7 +408,6 @@ async function _replicateEntry(entry, message) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Health / status
 app.get('/status', (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.json({
@@ -454,7 +420,6 @@ app.get('/status', (req, res) => {
   });
 });
 
-// Message entry-point (leader only; followers redirect)
 app.post('/stroke', async (req, res) => {
   if (role !== 'leader') {
     return res.status(307).json({ redirect: leaderId });
@@ -463,7 +428,6 @@ app.post('/stroke', async (req, res) => {
   res.json({ ok });
 });
 
-// RAFT: RequestVote RPC
 app.post('/request-vote', (req, res) => {
   const { term, candidateId, lastLogIndex, lastLogTerm } = req.body;
 
@@ -493,7 +457,6 @@ app.post('/request-vote', (req, res) => {
   res.json({ term: currentTerm, voteGranted: grant });
 });
 
-// RAFT: AppendEntries RPC
 app.post('/append-entries', (req, res) => {
   const { term, leaderId: lId, prevLogIndex, prevLogTerm, entries, leaderCommit } = req.body;
 
@@ -503,17 +466,14 @@ app.post('/append-entries', (req, res) => {
 
   becomeFollower(term, lId);
 
-  // Consistency check
   if (prevLogIndex >= 0) {
     const ourEntry = log[prevLogIndex];
     if (!ourEntry || ourEntry.term !== prevLogTerm) {
       resetElectionTimer();
-      // FIX: always return our actual log length so leader can set nextIndex correctly
       return res.json({ term: currentTerm, success: false, logLength: log.length });
     }
   }
 
-  // Append new entries, resolving conflicts
   if (entries && entries.length > 0) {
     for (const entry of entries) {
       if (entry.index < log.length) {
@@ -521,7 +481,6 @@ app.post('/append-entries', (req, res) => {
           log = log.slice(0, entry.index);
           log.push(entry);
         }
-        // identical entry already present — skip
       } else {
         log.push(entry);
       }
@@ -536,7 +495,6 @@ app.post('/append-entries', (req, res) => {
   res.json({ term: currentTerm, success: true, logLength: log.length });
 });
 
-// RAFT: Heartbeat RPC
 app.post('/heartbeat', (req, res) => {
   const { term, leaderId: lId } = req.body;
   if (term >= currentTerm) {
@@ -544,12 +502,10 @@ app.post('/heartbeat', (req, res) => {
     resetElectionTimer();
     return res.json({ term: currentTerm, ok: true });
   }
-  // term < currentTerm — reject and tell sender our higher term so it steps down
   log_msg(`Rejecting stale heartbeat from ${lId} (their term=${term}, ours=${currentTerm})`);
   res.json({ term: currentTerm, ok: false });
 });
 
-// RAFT: /sync-log — catch-up for rejoining followers
 app.post('/sync-log', (req, res) => {
   const { entries, leaderCommit, term } = req.body;
   if (term && term > currentTerm) becomeFollower(term);
@@ -563,7 +519,6 @@ app.post('/sync-log', (req, res) => {
   res.json({ ok: true, logLength: log.length });
 });
 
-// Debug: read committed log entries
 app.get('/log', (req, res) => {
   const from = parseInt(req.query.from ?? 0);
   res.json({
