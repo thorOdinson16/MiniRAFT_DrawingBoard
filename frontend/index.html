@@ -217,13 +217,34 @@ let eraserMode = false;
 function setEraser() { eraserMode = true; colorPicker.value = '#ffffff'; }
 colorPicker.addEventListener('input', () => { eraserMode = false; });
 
+// ── FIX: Dynamic WebSocket URL — no longer hardcoded to localhost:8080 ────────
+// Derives the gateway host from window.location so the frontend works correctly
+// when deployed to a cloud VM, a different hostname, or accessed from another
+// machine on the network. Falls back to localhost only when running locally.
+//
+// Previously: new WebSocket('ws://localhost:8080')
+// Problem:    Breaks on any non-local deployment (cloud VM, remote demo, etc.)
+// Fix:        Use window.location.hostname so the WS connects to whatever host
+//             served the page. Port 8080 is still the gateway's WS port.
+function getGatewayWsUrl() {
+  const host = window.location.hostname || 'localhost';
+  return `ws://${host}:8080`;
+}
+
+// ── FIX: Dynamic replica status URLs for the dashboard ───────────────────────
+// Same reasoning — replica poll URLs must use the actual hostname, not localhost.
+function getReplicaHttpUrl(port) {
+  const host = window.location.hostname || 'localhost';
+  return `http://${host}:${port}`;
+}
+
 // ── WebSocket with exponential-backoff reconnect ──────────────────────────────
 let ws;
 let reconnectAttempts = 0;
 let heartbeatInterval = null;
 
 function connect() {
-  ws = new WebSocket('ws://localhost:8080');
+  ws = new WebSocket(getGatewayWsUrl());
 
   if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
 
@@ -304,12 +325,10 @@ function clearCanvas() {
 }
 
 // ── Cluster status dashboard ──────────────────────────────────────────────────
-// Polls each replica's /status every 1.5 s to show leader/term/log size.
-// Required by spec §6.2 Observability.
 const REPLICAS = [
-  { id: 'replica1', url: 'http://localhost:4001', prefix: 'r1' },
-  { id: 'replica2', url: 'http://localhost:4002', prefix: 'r2' },
-  { id: 'replica3', url: 'http://localhost:4003', prefix: 'r3' },
+  { id: 'replica1', url: getReplicaHttpUrl(4001), prefix: 'r1' },
+  { id: 'replica2', url: getReplicaHttpUrl(4002), prefix: 'r2' },
+  { id: 'replica3', url: getReplicaHttpUrl(4003), prefix: 'r3' },
 ];
 
 async function pollReplica({ id, url, prefix }) {

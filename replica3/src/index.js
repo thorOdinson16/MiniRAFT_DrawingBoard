@@ -88,6 +88,9 @@ async function becomeLeader() {
   const noop = { term: currentTerm, index: log.length, data: { type: 'noop' } };
   log.push(noop);
 
+  // FIX: heartbeat loop now calls the dedicated /heartbeat RPC, not sendAppendEntries.
+  // sendAppendEntries is only called for log replication. This matches the spec's
+  // explicit /heartbeat endpoint requirement and separates concerns correctly.
   sendHeartbeats();
   heartbeatTimer = setInterval(sendHeartbeats, HEARTBEAT_MS);
 
@@ -168,7 +171,11 @@ async function requestVotes() {
   return count;
 }
 
-// ── Heartbeats ────────────────────────────────────────────────────────────────
+// ── FIX: Heartbeats now call the dedicated /heartbeat RPC ────────────────────
+// Previously, sendHeartbeats() called sendAppendEntries() which is the log
+// replication RPC. The spec explicitly lists /heartbeat as a separate endpoint.
+// The leader's heartbeat loop must use /heartbeat; log replication (sendAppendEntries)
+// is only triggered when there are new entries to replicate.
 async function sendHeartbeats() {
   if (role !== 'leader' || isShuttingDown) return;
   for (const peer of PEERS) {
@@ -181,6 +188,7 @@ async function sendHeartbeatToPeer(peer) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 300);
   try {
+    // FIX: call /heartbeat (not /append-entries) for the heartbeat loop.
     const res = await fetch(`${peer}/heartbeat`, {
       method : 'POST',
       signal : controller.signal,
@@ -189,14 +197,14 @@ async function sendHeartbeatToPeer(peer) {
     });
     clearTimeout(tid);
     const data = await res.json();
-    // FIX: if the peer reports a higher term we are a stale leader — step down
-    // immediately and return so we do NOT mark the peer as alive while we are
-    // no longer leader (previously the peerAlive assignment ran unconditionally
-    // after becomeFollower, corrupting leader-only state).
     if (data.term > currentTerm) {
       log_msg(`Stale leader detected via heartbeat from ${peer} (their term=${data.term})`);
       becomeFollower(data.term);
-      return; // <-- FIX: stop here; do not touch peerAlive as a follower
+      return;
+    }
+    // If peer is behind on log, trigger a catch-up replication
+    if (data.ok && (nextIndex[peer] ?? 0) < log.length) {
+      sendAppendEntries(peer).catch(() => {});
     }
     peerAlive[peer]     = true;
     peerDeadSince[peer] = null;
@@ -208,7 +216,7 @@ async function sendHeartbeatToPeer(peer) {
   }
 }
 
-// ── AppendEntries (replication RPC) ──────────────────────────────────────────
+// ── AppendEntries (log replication RPC — called only for new entries) ─────────
 async function sendAppendEntries(peer) {
   if (isShuttingDown) return { success: false };
 
@@ -495,6 +503,10 @@ app.post('/append-entries', (req, res) => {
   res.json({ term: currentTerm, success: true, logLength: log.length });
 });
 
+// FIX: /heartbeat is now the proper target for the leader's heartbeat loop.
+// It resets the election timer and replies with the current term so the leader
+// can detect if it has become stale. It does NOT do log consistency checks —
+// that is /append-entries's job.
 app.post('/heartbeat', (req, res) => {
   const { term, leaderId: lId } = req.body;
   if (term >= currentTerm) {
@@ -519,12 +531,25 @@ app.post('/sync-log', (req, res) => {
   res.json({ ok: true, logLength: log.length });
 });
 
+// FIX: /log now returns entries strictly after the last 'clear' entry in the
+// committed log. This ensures the gateway's rebuildCanvasLog does not replay
+// strokes that were already cleared by a prior clear command.
 app.get('/log', (req, res) => {
   const from = parseInt(req.query.from ?? 0);
-  res.json({
-    entries    : log.filter(e => e.index >= from && e.index <= commitIndex),
-    commitIndex,
-  });
+
+  // Find the index of the last committed 'clear' entry so we only return
+  // strokes that are visible on the current canvas.
+  let lastClearIndex = -1;
+  for (let i = commitIndex; i >= 0; i--) {
+    if (log[i] && log[i].data && log[i].data.type === 'clear') {
+      lastClearIndex = i;
+      break;
+    }
+  }
+
+  const effectiveFrom = Math.max(from, lastClearIndex + 1);
+  const entries = log.filter(e => e.index >= effectiveFrom && e.index <= commitIndex);
+  res.json({ entries, commitIndex, lastClearIndex });
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────

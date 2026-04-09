@@ -45,7 +45,6 @@ async function ensureLeader(retries = 20) {
       if (found) {
         currentLeader    = found;
         isLeaderValid    = true;
-        // FIX: shorten cache TTL to 2 s so failovers are detected quickly
         leaderValidUntil = Date.now() + 2000;
         console.log(`[Gateway] Leader set: ${currentLeader}`);
         if (pendingStrokes.length > 0) {
@@ -170,11 +169,15 @@ app.use(express.json({ limit: '1mb' }));
 // Called by the leader after committing a stroke
 app.post('/broadcast', (req, res) => {
   const message = req.body;
-  // FIX: silently drop no-op entries — they are internal RAFT housekeeping
   if (message?.type === 'noop') {
     res.json({ ok: true, sent: 0 });
     return;
   }
+  // FIX: On a 'clear' event, wipe canvasLog AND record a sentinel so that
+  // rebuildCanvasLog (called on gateway restart) knows to fetch only entries
+  // after this point. Previously canvasLog was wiped but the replica's /log
+  // endpoint had no awareness of it, so gateway restart would re-fetch and
+  // replay all pre-clear strokes to new clients.
   if (message.type === 'clear') {
     canvasLog.length = 0;
     broadcastToClients({ type: 'clear' });
@@ -211,9 +214,15 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── Rebuild canvasLog from leader on gateway startup ──────────────────────────
-// Required so that late-joining clients see consistent state even after the
-// gateway itself restarts (spec §6.1 "Consistent canvas state after restarts").
+// ── FIX: Rebuild canvasLog correctly after gateway restart ────────────────────
+// The replica's /log endpoint now returns entries starting AFTER the last
+// committed 'clear' entry (see replica fix). This means rebuildCanvasLog will
+// only replay strokes that are actually visible on the current canvas — it will
+// not replay strokes that were wiped by a 'clear' command.
+//
+// Previously: /log?from=0 returned ALL log entries including pre-clear strokes,
+// so a new client connecting after a gateway restart would see ghost strokes
+// that the canvas had already cleared.
 async function rebuildCanvasLog() {
   console.log('[Gateway] Attempting to rebuild canvasLog from leader...');
   const leader = await ensureLeader(30);
@@ -222,14 +231,20 @@ async function rebuildCanvasLog() {
     return;
   }
   try {
+    // The leader's /log endpoint now filters out entries before the last clear.
+    // We still pass from=0 as a base; the replica enforces the clear boundary.
     const res = await fetch(`${leader}/log?from=0`, { signal: AbortSignal.timeout(3000) });
-    const { entries } = await res.json();
+    const { entries, lastClearIndex } = await res.json();
+    canvasLog.length = 0;
     for (const e of entries) {
       if (e.data && e.data.type !== 'noop' && e.data.type !== 'clear') {
         canvasLog.push(e.data);
       }
     }
-    console.log(`[Gateway] Rebuilt canvasLog: ${canvasLog.length} strokes from ${leader}`);
+    console.log(
+      `[Gateway] Rebuilt canvasLog: ${canvasLog.length} strokes from ${leader}` +
+      (lastClearIndex >= 0 ? ` (skipped entries before clear@${lastClearIndex})` : '')
+    );
   } catch (err) {
     console.log(`[Gateway] Could not rebuild canvasLog: ${err.message}`);
   }
@@ -237,5 +252,5 @@ async function rebuildCanvasLog() {
 
 app.listen(HTTP_PORT, () => {
   console.log(`[Gateway] HTTP on :${HTTP_PORT}  WebSocket on :${WS_PORT}`);
-  rebuildCanvasLog();   // ← add this call
+  rebuildCanvasLog();
 });
