@@ -2,8 +2,8 @@ import { WebSocketServer } from 'ws';
 import fetch               from 'node-fetch';
 import express             from 'express';
 
-const REPLICAS = process.env.REPLICAS.split(',');
-const WS_PORT  = 8080;
+const REPLICAS  = process.env.REPLICAS.split(',');
+const WS_PORT   = 8080;
 const HTTP_PORT = 8081;
 
 // ── Leader state ──────────────────────────────────────────────────────────────
@@ -13,11 +13,11 @@ let leaderDiscoveryPromise = null;
 let leaderValidUntil       = 0;
 
 // ── Client & canvas state ─────────────────────────────────────────────────────
-const clients    = new Set();
-const canvasLog  = []; // replay buffer for late-joining clients
+const clients        = new Set();
+const canvasLog      = [];   // replay buffer for late-joining clients
 const pendingStrokes = [];
 
-// ── Leader discovery ───────────────────────────────────────────────────────────
+// ── Leader discovery ──────────────────────────────────────────────────────────
 async function findLeader() {
   for (const url of REPLICAS) {
     try {
@@ -34,12 +34,9 @@ async function findLeader() {
 }
 
 async function ensureLeader(retries = 20) {
-  // Fast path: reuse cached leader for up to 5 s
   if (currentLeader && isLeaderValid && Date.now() < leaderValidUntil) {
     return currentLeader;
   }
-
-  // Deduplicate concurrent discovery calls
   if (leaderDiscoveryPromise) return leaderDiscoveryPromise;
 
   leaderDiscoveryPromise = (async () => {
@@ -48,9 +45,9 @@ async function ensureLeader(retries = 20) {
       if (found) {
         currentLeader    = found;
         isLeaderValid    = true;
-        leaderValidUntil = Date.now() + 5000;
+        // FIX: shorten cache TTL to 2 s so failovers are detected quickly
+        leaderValidUntil = Date.now() + 2000;
         console.log(`[Gateway] Leader set: ${currentLeader}`);
-        // Drain any strokes queued while we had no leader
         if (pendingStrokes.length > 0) {
           console.log(`[Gateway] Draining ${pendingStrokes.length} pending strokes`);
           const toSend = pendingStrokes.splice(0);
@@ -69,7 +66,7 @@ async function ensureLeader(retries = 20) {
   return leaderDiscoveryPromise;
 }
 
-// ── Forward stroke to leader ───────────────────────────────────────────────────
+// ── Forward stroke to leader ──────────────────────────────────────────────────
 async function forwardToLeader(stroke, maxAttempts = 10) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const leader = await ensureLeader(20);
@@ -82,6 +79,7 @@ async function forwardToLeader(stroke, maxAttempts = 10) {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body   : JSON.stringify(stroke),
+        signal : AbortSignal.timeout(2000),
       });
 
       if (res.status === 307) {
@@ -89,7 +87,7 @@ async function forwardToLeader(stroke, maxAttempts = 10) {
         if (data.redirect) {
           currentLeader    = data.redirect;
           isLeaderValid    = true;
-          leaderValidUntil = Date.now() + 30000;
+          leaderValidUntil = Date.now() + 2000;
         } else {
           currentLeader = null;
           isLeaderValid = false;
@@ -114,12 +112,12 @@ async function forwardToLeader(stroke, maxAttempts = 10) {
   return false;
 }
 
-// ── Broadcast to all WebSocket clients ────────────────────────────────────────
+// ── Broadcast to all WebSocket clients ───────────────────────────────────────
 function broadcastToClients(message) {
   const dead = [];
   let sent   = 0;
   for (const ws of clients) {
-    if (ws.readyState === 1 /* OPEN */) {
+    if (ws.readyState === 1) {
       try { ws.send(JSON.stringify(message)); sent++; }
       catch (_) { dead.push(ws); }
     } else {
@@ -130,7 +128,7 @@ function broadcastToClients(message) {
   return sent;
 }
 
-// ── Replay canvas state to a new client ───────────────────────────────────────
+// ── Replay canvas state to a new client ──────────────────────────────────────
 async function replayCanvasToClient(ws) {
   if (canvasLog.length === 0) return;
   console.log(`[Gateway] Replaying ${canvasLog.length} strokes to new client`);
@@ -140,7 +138,7 @@ async function replayCanvasToClient(ws) {
   }
 }
 
-// ── WebSocket server ───────────────────────────────────────────────────────────
+// ── WebSocket server ──────────────────────────────────────────────────────────
 const wss = new WebSocketServer({ port: WS_PORT });
 
 wss.on('connection', async (ws) => {
@@ -151,13 +149,10 @@ wss.on('connection', async (ws) => {
   ws.on('message', async (raw) => {
     let message;
     try { message = JSON.parse(raw); } catch { return; }
-
     if (message.type === 'ping') {
       ws.send(JSON.stringify({ type: 'pong' }));
       return;
     }
-
-    // All messages (including clear) go through Raft consensus for ordering
     await forwardToLeader(message);
   });
 
@@ -168,13 +163,18 @@ wss.on('connection', async (ws) => {
   ws.on('error', () => clients.delete(ws));
 });
 
-// ── HTTP endpoints (called by replicas) ───────────────────────────────────────
+// ── HTTP endpoints (called by replicas) ──────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Called by the leader after committing a stroke — broadcast to all WS clients
+// Called by the leader after committing a stroke
 app.post('/broadcast', (req, res) => {
   const message = req.body;
+  // FIX: silently drop no-op entries — they are internal RAFT housekeeping
+  if (message?.type === 'noop') {
+    res.json({ ok: true, sent: 0 });
+    return;
+  }
   if (message.type === 'clear') {
     canvasLog.length = 0;
     broadcastToClients({ type: 'clear' });
@@ -188,19 +188,19 @@ app.post('/broadcast', (req, res) => {
   res.json({ ok: true, sent });
 });
 
-// Called by a newly elected leader to fast-update gateway cache
+// Called by a newly elected leader
 app.post('/leader-announce', (req, res) => {
   const { leader } = req.body;
   if (!leader) return res.status(400).json({ error: 'leader required' });
   console.log(`[Gateway] Leader announced: ${leader}`);
-  currentLeader    = leader;
-  isLeaderValid    = true;
-  leaderValidUntil = Date.now() + 5000;
+  currentLeader          = leader;
+  isLeaderValid          = true;
+  leaderValidUntil       = Date.now() + 2000;
   leaderDiscoveryPromise = null;
   res.json({ ok: true });
 });
 
-// Healthcheck endpoint used by docker-compose HEALTHCHECK directive
+// Healthcheck
 app.get('/health', (req, res) => {
   res.json({
     status        : 'ok',
