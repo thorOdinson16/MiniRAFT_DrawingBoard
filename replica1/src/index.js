@@ -189,12 +189,19 @@ async function sendHeartbeatToPeer(peer) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 300);
   try {
-    await fetch(`${peer}/heartbeat`, {
+    const res = await fetch(`${peer}/heartbeat`, {
       method : 'POST',
       signal : controller.signal,
       headers: { 'Content-Type': 'application/json' },
       body   : JSON.stringify({ term: currentTerm, leaderId: `http://${REPLICA_ID}:${PORT}` }),
     });
+    clearTimeout(tid);
+    const data = await res.json();
+    // If a peer reports a higher term, we are a stale leader — step down immediately
+    if (data.term > currentTerm) {
+      log_msg(`Stale leader detected via heartbeat response from ${peer} (their term=${data.term})`);
+      becomeFollower(data.term);
+    }
     peerAlive[peer]     = true;
     peerDeadSince[peer] = null;
   } catch (_) {
@@ -535,8 +542,11 @@ app.post('/heartbeat', (req, res) => {
   if (term >= currentTerm) {
     becomeFollower(term, lId);
     resetElectionTimer();
+    return res.json({ term: currentTerm, ok: true });
   }
-  res.json({ term: currentTerm, ok: true });
+  // term < currentTerm — reject and tell sender our higher term so it steps down
+  log_msg(`Rejecting stale heartbeat from ${lId} (their term=${term}, ours=${currentTerm})`);
+  res.json({ term: currentTerm, ok: false });
 });
 
 // RAFT: /sync-log — catch-up for rejoining followers

@@ -211,6 +211,31 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ── Rebuild canvasLog from leader on gateway startup ──────────────────────────
+// Required so that late-joining clients see consistent state even after the
+// gateway itself restarts (spec §6.1 "Consistent canvas state after restarts").
+async function rebuildCanvasLog() {
+  console.log('[Gateway] Attempting to rebuild canvasLog from leader...');
+  const leader = await ensureLeader(30);
+  if (!leader) {
+    console.log('[Gateway] No leader available — canvasLog will be empty until first stroke');
+    return;
+  }
+  try {
+    const res = await fetch(`${leader}/log?from=0`, { signal: AbortSignal.timeout(3000) });
+    const { entries } = await res.json();
+    for (const e of entries) {
+      if (e.data && e.data.type !== 'noop' && e.data.type !== 'clear') {
+        canvasLog.push(e.data);
+      }
+    }
+    console.log(`[Gateway] Rebuilt canvasLog: ${canvasLog.length} strokes from ${leader}`);
+  } catch (err) {
+    console.log(`[Gateway] Could not rebuild canvasLog: ${err.message}`);
+  }
+}
+
 app.listen(HTTP_PORT, () => {
   console.log(`[Gateway] HTTP on :${HTTP_PORT}  WebSocket on :${WS_PORT}`);
+  rebuildCanvasLog();   // ← add this call
 });
