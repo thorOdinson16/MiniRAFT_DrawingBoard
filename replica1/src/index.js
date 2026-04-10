@@ -288,6 +288,8 @@ async function sendAppendEntries(peer) {
       const ackedIndex = entriesToSend[entriesToSend.length - 1].index;
       matchIndex[peer] = Math.max(matchIndex[peer] ?? -1, ackedIndex);
       nextIndex[peer]  = ackedIndex + 1;
+
+      tryAdvanceCommitIndex();
     }
 
     return { success: true, peer };
