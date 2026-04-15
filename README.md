@@ -150,15 +150,5 @@ The cluster tolerates **1 node failure** out of 3 (majority = 2).
 - **Containerisation** — Docker + Docker Compose, nginx (frontend)
 - **Dev** — nodemon with live reload via volume mounts
 
----
-
-## 📚 Learn More
-
-- [The RAFT Paper — Ongaro & Ousterhout (2014)](https://raft.github.io/raft.pdf)
-- [The Secret Lives of Data — animated RAFT visualization](http://thesecretlivesofdata.com/raft/)
-
----
-
-## 📄 License
 
 MIT — see [LICENSE](LICENSE) for details.
